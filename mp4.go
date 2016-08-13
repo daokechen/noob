@@ -6,15 +6,12 @@ import (
 	"os"
 )
 
-type BoxDecoder func(boxLen uint32, f *os.File)
+type BoxDecoder func(buffer []byte, boxLen uint32)
 
 var decoders map[string]BoxDecoder
 
 func InitDecoders() {
 	decoders = map[string]BoxDecoder{
-		"mdat": parseMdat,
-		"ftyp": parseFtyp,
-		"moov": parseMoov,
 		"mvhd": parseMvhd,
 		"iods": parseIods,
 		"trak": parseTrak,
@@ -28,8 +25,9 @@ func InitDecoders() {
 		"dref": parseDref,
 		"stbl": parseStbl,
 		"stsd": parseStsd,
+		"hmhd": parseHmhd,
 		"avcC": parseAvcc,
-		"btrt": parseBtrt,
+		"tref": parseTref,
 		"stts": parseStts,
 		"stss": parseStss,
 		"stsc": parseStsc,
@@ -38,12 +36,13 @@ func InitDecoders() {
 		"co64": parseCo64,
 		"smhd": parseSmhd,
 		"esds": parseEsds,
-		"free": parseFree,
+		"udta": parseUdta,
+		"avc1": parseAvc1,
+		"mp4a": parseMp4a,
 	}
 }
 
 func parseMdat(boxLen uint32, f *os.File) {
-	fmt.Println("mdat len ", boxLen)
 	if boxLen == 1 {
 		var buffer [8]byte
 		rlen, err := f.Read(buffer[:])
@@ -54,8 +53,10 @@ func parseMdat(boxLen uint32, f *os.File) {
 
 		mlen := byte82Uint64(buffer[:])
 		f.Seek(int64(mlen-16), os.SEEK_CUR)
+		fmt.Println("mdat len ", mlen)
 	} else {
 		f.Seek(int64(boxLen-8), os.SEEK_CUR)
+		fmt.Println("mdat len ", boxLen)
 	}
 
 	ReadBox(f)
@@ -65,6 +66,30 @@ func parseFtyp(boxLen uint32, f *os.File) {
 	fmt.Println("ftyp len ", boxLen)
 	f.Seek(int64(boxLen-8), os.SEEK_CUR)
 	ReadBox(f)
+}
+
+func parseAtomBox(buffer []byte, boxLen uint32, spaceCount int) {
+	var count uint32 = 0
+
+	for boxLen != count {
+		atomLen := byte42Uint32(buffer[count : count+4])
+		atomName := string(buffer[count+4 : count+8])
+		for i := 0; i < spaceCount; i++ {
+			fmt.Printf("\t")
+		}
+
+		if decoder, ok := decoders[atomName]; ok {
+			decoder(buffer[count+8:], atomLen-8)
+		} else {
+			fmt.Println("\tunknown box ", atomName)
+		}
+
+		count += atomLen
+	}
+}
+
+func parseUdta(buffer []byte, atomLen uint32) {
+	fmt.Println("\tudta len ", atomLen)
 }
 
 func parseMoov(boxLen uint32, f *os.File) {
@@ -77,99 +102,141 @@ func parseMoov(boxLen uint32, f *os.File) {
 		fmt.Println("read moov len ", rlen, " err ", err)
 		return
 	}
+
+	parseAtomBox(buffer, boxLen-8, 1)
 	ReadBox(f)
 }
 
-func parseMvhd(boxLen uint32, f *os.File) {
-	fmt.Println("mvhd")
+func parseMvhd(buffer []byte, boxLen uint32) {
+	fmt.Println("mvhd len ", boxLen)
 }
 
-func parseIods(boxLen uint32, f *os.File) {
-	fmt.Println("iods")
+func parseIods(buffer []byte, boxLen uint32) {
+	fmt.Println("iods len ", boxLen)
 }
 
-func parseTrak(boxLen uint32, f *os.File) {
-	fmt.Println("trak")
+func parseTrak(buffer []byte, boxLen uint32) {
+	fmt.Println("trak len ", boxLen)
+	parseAtomBox(buffer, boxLen, 1)
 }
 
-func parseTkhd(boxLen uint32, f *os.File) {
-	fmt.Println("tkhd")
+func parseTkhd(buffer []byte, boxLen uint32) {
+	fmt.Println("\ttkhd len ", boxLen)
 }
 
-func parseMdia(boxLen uint32, f *os.File) {
-	fmt.Println("mdia")
+func parseMdia(buffer []byte, boxLen uint32) {
+	fmt.Println("\tmdia len ", boxLen)
+	parseAtomBox(buffer, boxLen, 2)
 }
 
-func parseMdhd(boxLen uint32, f *os.File) {
-	fmt.Println("mdhd")
+func parseMdhd(buffer []byte, boxLen uint32) {
+	fmt.Println("\tmdhd len ", boxLen)
 }
 
-func parseHdlr(boxLen uint32, f *os.File) {
-	fmt.Println("hdlr")
+func parseHdlr(buffer []byte, boxLen uint32) {
+	fmt.Println("\thdlr len ", boxLen)
 }
 
-func parseMinf(boxLen uint32, f *os.File) {
-	fmt.Println("minf")
+func parseMinf(buffer []byte, boxLen uint32) {
+	fmt.Println("\tminf len ", boxLen)
+	parseAtomBox(buffer, boxLen, 3)
 }
 
-func parseVmhd(boxLen uint32, f *os.File) {
-	fmt.Println("vmhd")
+func parseVmhd(buffer []byte, boxLen uint32) {
+	fmt.Println("\tvmhd len ", boxLen)
 }
 
-func parseDinf(boxLen uint32, f *os.File) {
-	fmt.Println("dinf")
+func parseTref(buffer []byte, boxLen uint32) {
+	fmt.Println("\ttref len ", boxLen)
 }
 
-func parseDref(boxLen uint32, f *os.File) {
-	fmt.Println("dref")
+func parseHmhd(buffer []byte, boxLen uint32) {
+	fmt.Println("\thmhd len ", boxLen)
 }
 
-func parseStbl(boxLen uint32, f *os.File) {
-	fmt.Println("stbl")
+func parseDinf(buffer []byte, boxLen uint32) {
+	fmt.Println("\tdinf len ", boxLen)
+	parseAtomBox(buffer, boxLen, 4)
 }
 
-func parseStsd(boxLen uint32, f *os.File) {
-	fmt.Println("stsd")
+func parseDref(buffer []byte, boxLen uint32) {
+	fmt.Println("\tdref len ", boxLen)
 }
 
-func parseAvcc(boxLen uint32, f *os.File) {
-	fmt.Println("avcc")
+func parseStbl(buffer []byte, boxLen uint32) {
+	fmt.Println("\tstbl len ", boxLen)
+	parseAtomBox(buffer, boxLen, 4)
 }
 
-func parseBtrt(boxLen uint32, f *os.File) {
-	fmt.Println("btrt")
+func parseStsd(buffer []byte, boxLen uint32) {
+	fmt.Println("\tstsd len ", boxLen)
+	slen := byte42Uint32(buffer[4:8])
+	if slen != 1 {
+		fmt.Println("only support one description")
+		return
+	}
+
+	parseAtomBox(buffer[8:], boxLen-8, 5)
 }
 
-func parseStts(boxLen uint32, f *os.File) {
-	fmt.Println("stts")
+func parseAvcc(buffer []byte, boxLen uint32) {
+	fmt.Println("\t\t\t\t\t\t\tavcc len ", boxLen)
 }
 
-func parseStss(boxLen uint32, f *os.File) {
-	fmt.Println("stss")
+func parseStts(buffer []byte, boxLen uint32) {
+	fmt.Println("\tstts len ", boxLen, 4)
 }
 
-func parseStsc(boxLen uint32, f *os.File) {
-	fmt.Println("stsc")
+func parseStss(buffer []byte, boxLen uint32) {
+	fmt.Println("\tstss len ", boxLen)
 }
 
-func parseStsz(boxLen uint32, f *os.File) {
-	fmt.Println("stsz")
+func parseStsc(buffer []byte, boxLen uint32) {
+	fmt.Println("\tstsc len ", boxLen)
 }
 
-func parseStco(boxLen uint32, f *os.File) {
-	fmt.Println("stco")
+func parseStsz(buffer []byte, boxLen uint32) {
+	fmt.Println("\tstsz len ", boxLen)
 }
 
-func parseCo64(boxLen uint32, f *os.File) {
-	fmt.Println("co64")
+func parseStco(buffer []byte, boxLen uint32) {
+	fmt.Println("\tstco len ", boxLen)
 }
 
-func parseSmhd(boxLen uint32, f *os.File) {
-	fmt.Println("smhd")
+func parseCo64(buffer []byte, boxLen uint32) {
+	fmt.Println("\tco64 len ", boxLen)
 }
 
-func parseEsds(boxLen uint32, f *os.File) {
-	fmt.Println("esds")
+func parseSmhd(buffer []byte, boxLen uint32) {
+	fmt.Println("\tsmhd len ", boxLen)
+}
+
+func parseEsds(buffer []byte, boxLen uint32) {
+	fmt.Println("\t\t\t\t\t\t\tesds len ", boxLen)
+}
+
+func parseAvc1(buffer []byte, boxLen uint32) {
+	fmt.Println("\tavc1 len ", boxLen)
+	avccLen := byte42Uint32(buffer[78:82])
+	atomName := string(buffer[82:86])
+	if atomName != "avcC" {
+		fmt.Println("not found avcc ")
+		return
+	}
+
+	parseAvcc(buffer[86:], avccLen)
+}
+
+func parseMp4a(buffer []byte, boxLen uint32) {
+	fmt.Println("\tmp4a len ", boxLen)
+	esdsLen := byte42Uint32(buffer[28:32])
+	atomName := string(buffer[32:36])
+	if atomName != "esds" {
+		fmt.Println("not found esds ")
+		return
+	}
+
+	parseEsds(buffer[36:], esdsLen)
 }
 
 func parseFree(boxLen uint32, f *os.File) {
@@ -227,12 +294,6 @@ func ReadBox(f *os.File) {
 	default:
 		fmt.Println("unknown box ", box)
 	}
-
-	/*if decoder, ok := decoders[box]; ok {
-		decoder(blen, f)
-	} else {
-		fmt.Println("unknown box ", box)
-	}*/
 }
 
 func ParseMp4(filename string) {
