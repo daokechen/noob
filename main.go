@@ -26,7 +26,8 @@ func main() {
 	}
 
 	InitDecoders()
-	ParseMp4(os.Args[1])
+	mp4 := ParseMp4(os.Args[1])
+	fmt.Println("mp4 len ", mp4.VideoInfo[0].FrameLen)
 
 	tcpAddr, err := net.ResolveTCPAddr("tcp4", ":"+port)
 	if err != nil {

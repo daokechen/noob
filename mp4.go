@@ -3,10 +3,53 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 )
 
-type BoxDecoder func(buffer []byte, boxLen uint32)
+const (
+	FRAME_AUDIO     = 0
+	FRAME_VIDEO_I   = 1 //65
+	FRAME_VIDEO_SPS = 2 //67
+	FRAME_VIDEO_PPS = 3 //68
+	FRAME_VIDEO_SEI = 4 // 06
+)
+
+type SampleInfo struct {
+	FrameLen  uint32
+	Offset    uint32
+	FrameType uint32
+	Delta     uint32
+}
+
+const (
+	TRAK_AUDIO = "soun"
+	TRAK_VIDEO = "vide"
+	TRAK_HINT  = "hint"
+)
+
+type ChunkInfo struct {
+	firstIndex  int
+	sampleCount int
+}
+
+type Mp4Info struct {
+	AudioInfo   []SampleInfo
+	VideoInfo   []SampleInfo
+	curTrakType string
+	audioChunk  []ChunkInfo
+	videoChunk  []ChunkInfo
+	sttsBuffer  []byte
+	stszBuffer  []byte
+	stssBuffer  []byte
+	stcoBuffer  []byte
+	stscBuffer  []byte
+	co64Buffer  []byte
+}
+
+var logger *log.Logger
+
+type BoxDecoder func(mp4 *Mp4Info, buffer []byte, boxLen uint32)
 
 var decoders map[string]BoxDecoder
 
@@ -42,7 +85,230 @@ func InitDecoders() {
 	}
 }
 
-func parseMdat(boxLen uint32, f *os.File) {
+func (mp4 *Mp4Info) stssParse() {
+	frameICount := mp4.stssBuffer[4:8]
+	count := byte42Uint32(frameICount)
+
+	for i := 0; i < int(count); i++ {
+		frameIIndex := mp4.stssBuffer[8+4*i : 12+4*i]
+		index := byte42Uint32(frameIIndex)
+		mp4.VideoInfo[index-1].FrameType = FRAME_VIDEO_I
+		//logger.Println("index ", i, " iframe ", index)
+	}
+
+	//fmt.Println("stss count ", count)
+}
+
+func (mp4 *Mp4Info) stscParse() {
+	stscCount := mp4.stscBuffer[4:8]
+	count := byte42Uint32(stscCount)
+
+	//var si []SampleInfo
+	//var avOffsets []uint32
+	var ci []ChunkInfo
+
+	if mp4.curTrakType == TRAK_AUDIO {
+		//si = mp4.AudioInfo[:]
+		//avOffsets = mp4.audioOffsets[:]
+		mp4.audioChunk = make([]ChunkInfo, count)
+		ci = mp4.audioChunk
+	} else if mp4.curTrakType == TRAK_VIDEO {
+		//si = mp4.VideoInfo[:]
+		//avOffsets = mp4.videoOffsets[:]
+		mp4.videoChunk = make([]ChunkInfo, count)
+		ci = mp4.videoChunk
+	}
+
+	for i := 0; i < int(count); i++ {
+		firstChunk := mp4.stscBuffer[8+12*i : 12+12*i]
+		fc := byte42Uint32(firstChunk)
+		sampleCount := mp4.stscBuffer[12+12*i : 16+12*i]
+		sc := byte42Uint32(sampleCount)
+		ci[i].firstIndex = int(fc)
+		ci[i].sampleCount = int(sc)
+		//logger.Println("index ", i, " fc ", fc, " sc ", sc)
+	}
+}
+
+func (mp4 *Mp4Info) stcoParse() {
+	offsetCount := mp4.stcoBuffer[4:8]
+	count := byte42Uint32(offsetCount)
+
+	var ci []ChunkInfo
+	var si []SampleInfo
+
+	if mp4.curTrakType == TRAK_AUDIO {
+		ci = mp4.audioChunk
+		si = mp4.AudioInfo
+	} else if mp4.curTrakType == TRAK_VIDEO {
+		ci = mp4.videoChunk
+		si = mp4.VideoInfo
+	}
+
+	curStscIndex := 0
+	sampleIndex := 0
+
+	for i := 0; i < int(count); i++ {
+		chunkOffset := mp4.stcoBuffer[8+4*i : 12+4*i]
+		co := byte42Uint32(chunkOffset)
+
+		// 第一个chunk肯定是 1,所以第一次直接和ci[1]比较
+		if curStscIndex == len(ci)-1 || (i+1) < ci[curStscIndex+1].firstIndex {
+			si[sampleIndex].Offset = co
+			logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 1",
+				sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+				si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+			sampleIndex++
+			for j := 1; j < ci[curStscIndex].sampleCount; j++ {
+				si[sampleIndex].Offset = si[sampleIndex-1].Offset + si[sampleIndex-1].FrameLen
+				logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 2",
+					sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+					si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+				sampleIndex++
+			}
+		} else {
+			curStscIndex++
+
+			si[sampleIndex].Offset = co
+			logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 3",
+				sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+				si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+			sampleIndex++
+			for j := 1; j < ci[curStscIndex].sampleCount; j++ {
+				si[sampleIndex].Offset = si[sampleIndex-1].Offset + si[sampleIndex-1].FrameLen
+				logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 4",
+					sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+					si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+				sampleIndex++
+			}
+		}
+		//logger.Println("chunk offset index ", i, " offset ", co)
+	}
+}
+
+func (mp4 *Mp4Info) co64Parse() {
+	offsetCount := mp4.co64Buffer[4:8]
+	count := byte42Uint32(offsetCount)
+
+	var ci []ChunkInfo
+	var si []SampleInfo
+
+	if mp4.curTrakType == TRAK_AUDIO {
+		ci = mp4.audioChunk
+		si = mp4.AudioInfo
+	} else if mp4.curTrakType == TRAK_VIDEO {
+		ci = mp4.videoChunk
+		si = mp4.VideoInfo
+	}
+
+	curStscIndex := 0
+	sampleIndex := 0
+
+	fmt.Println("stsc count ", len(ci))
+
+	for i := 0; i < int(count); i++ {
+		chunkOffset := mp4.co64Buffer[12+8*i : 16+8*i]
+		co := byte42Uint32(chunkOffset)
+
+		// 第一个chunk肯定是 1,所以第一次直接和ci[1]比较
+		if curStscIndex == len(ci)-1 || (i+1) < ci[curStscIndex+1].firstIndex {
+			si[sampleIndex].Offset = co
+			logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 1",
+				sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+				si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+			sampleIndex++
+			for j := 1; j < ci[curStscIndex].sampleCount; j++ {
+				si[sampleIndex].Offset = si[sampleIndex-1].Offset + si[sampleIndex-1].FrameLen
+				logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 2",
+					sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+					si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+				sampleIndex++
+			}
+		} else {
+			curStscIndex++
+
+			si[sampleIndex].Offset = co
+			logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 3",
+				sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+				si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+			sampleIndex++
+			for j := 1; j < ci[curStscIndex].sampleCount; j++ {
+				si[sampleIndex].Offset = si[sampleIndex-1].Offset + si[sampleIndex-1].FrameLen
+				logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 4",
+					sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+					si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+				sampleIndex++
+			}
+		}
+		//logger.Println("chunk offset index ", i, " offset ", co)
+	}
+}
+
+func (mp4 *Mp4Info) sttsParse() {
+	durationCount := mp4.sttsBuffer[4:8]
+	count := byte42Uint32(durationCount)
+
+	var si []SampleInfo
+
+	if mp4.curTrakType == TRAK_AUDIO {
+		si = mp4.AudioInfo[:]
+	} else if mp4.curTrakType == TRAK_VIDEO {
+		si = mp4.VideoInfo[:]
+	}
+
+	siCount := 0
+	for i := 0; i < int(count); i++ {
+		sampleCount := mp4.sttsBuffer[8+8*i : 12+8*i]
+		sc := byte42Uint32(sampleCount)
+		sampleDuration := mp4.sttsBuffer[12+8*i : 16+8*i]
+		sd := byte42Uint32(sampleDuration)
+		for j := 0; j < int(sc); j++ {
+			si[j+siCount].Delta = sd
+			//logger.Println("index ", j+siCount, " duration ", sd)
+		}
+
+		//fmt.Println("sample count ", sc, " si len ", len(si))
+		siCount += int(sc)
+	}
+}
+
+func (mp4 *Mp4Info) stszParse() {
+	sampleCount := mp4.stszBuffer[8:12]
+	count := byte42Uint32(sampleCount)
+	var si []SampleInfo
+
+	if mp4.curTrakType == TRAK_AUDIO {
+		mp4.AudioInfo = make([]SampleInfo, count)
+		si = mp4.AudioInfo[:]
+	} else if mp4.curTrakType == TRAK_VIDEO {
+		mp4.VideoInfo = make([]SampleInfo, count)
+		si = mp4.VideoInfo[:]
+	}
+
+	for i := 0; i < int(count); i++ {
+		sampleSize := mp4.stszBuffer[12+4*i : 16+4*i]
+		ss := byte42Uint32(sampleSize)
+		si[i].FrameLen = ss
+		//logger.Println("index ", i, " size ", ss)
+	}
+
+	if mp4.curTrakType == TRAK_VIDEO {
+		mp4.stssParse()
+	}
+
+	mp4.sttsParse()
+	mp4.stscParse()
+
+	if len(mp4.stcoBuffer) > 0 {
+		mp4.stcoParse()
+	} else {
+		mp4.co64Parse()
+	}
+
+	//fmt.Println("sample count ", count)
+}
+
+func (mp4 *Mp4Info) parseMdat(boxLen uint32, f *os.File) {
 	if boxLen == 1 {
 		var buffer [8]byte
 		rlen, err := f.Read(buffer[:])
@@ -59,16 +325,16 @@ func parseMdat(boxLen uint32, f *os.File) {
 		fmt.Println("mdat len ", boxLen)
 	}
 
-	ReadBox(f)
+	mp4.ReadBox(f)
 }
 
-func parseFtyp(boxLen uint32, f *os.File) {
+func (mp4 *Mp4Info) parseFtyp(boxLen uint32, f *os.File) {
 	fmt.Println("ftyp len ", boxLen)
 	f.Seek(int64(boxLen-8), os.SEEK_CUR)
-	ReadBox(f)
+	mp4.ReadBox(f)
 }
 
-func parseAtomBox(buffer []byte, boxLen uint32, spaceCount int) {
+func (mp4 *Mp4Info) parseAtomBox(buffer []byte, boxLen uint32, spaceCount int) {
 	var count uint32 = 0
 
 	for boxLen != count {
@@ -79,7 +345,7 @@ func parseAtomBox(buffer []byte, boxLen uint32, spaceCount int) {
 		}
 
 		if decoder, ok := decoders[atomName]; ok {
-			decoder(buffer[count+8:], atomLen-8)
+			decoder(mp4, buffer[count+8:], atomLen-8)
 		} else {
 			fmt.Println("\tunknown box ", atomName)
 		}
@@ -88,11 +354,11 @@ func parseAtomBox(buffer []byte, boxLen uint32, spaceCount int) {
 	}
 }
 
-func parseUdta(buffer []byte, atomLen uint32) {
+func parseUdta(mp4 *Mp4Info, buffer []byte, atomLen uint32) {
 	fmt.Println("\tudta len ", atomLen)
 }
 
-func parseMoov(boxLen uint32, f *os.File) {
+func (mp4 *Mp4Info) parseMoov(boxLen uint32, f *os.File) {
 	fmt.Println("moov len ", boxLen)
 	var blen int = int(boxLen - 8)
 	buffer := make([]byte, blen)
@@ -103,72 +369,83 @@ func parseMoov(boxLen uint32, f *os.File) {
 		return
 	}
 
-	parseAtomBox(buffer, boxLen-8, 1)
-	ReadBox(f)
+	mp4.parseAtomBox(buffer, boxLen-8, 1)
+	mp4.ReadBox(f)
 }
 
-func parseMvhd(buffer []byte, boxLen uint32) {
+func parseMvhd(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("mvhd len ", boxLen)
 }
 
-func parseIods(buffer []byte, boxLen uint32) {
+func parseIods(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("iods len ", boxLen)
 }
 
-func parseTrak(buffer []byte, boxLen uint32) {
+func parseTrak(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("trak len ", boxLen)
-	parseAtomBox(buffer, boxLen, 1)
+	mp4.parseAtomBox(buffer, boxLen, 1)
+
+	if mp4.curTrakType == TRAK_AUDIO || mp4.curTrakType == TRAK_VIDEO {
+		mp4.stszParse()
+	}
 }
 
-func parseTkhd(buffer []byte, boxLen uint32) {
+func parseTkhd(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\ttkhd len ", boxLen)
 }
 
-func parseMdia(buffer []byte, boxLen uint32) {
+func parseMdia(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tmdia len ", boxLen)
-	parseAtomBox(buffer, boxLen, 2)
+	mp4.parseAtomBox(buffer, boxLen, 2)
 }
 
-func parseMdhd(buffer []byte, boxLen uint32) {
+func parseMdhd(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tmdhd len ", boxLen)
 }
 
-func parseHdlr(buffer []byte, boxLen uint32) {
+func parseHdlr(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\thdlr len ", boxLen)
+	trakType := string(buffer[8:12])
+	if trakType == TRAK_AUDIO || trakType == TRAK_VIDEO || trakType == TRAK_HINT {
+		mp4.curTrakType = trakType
+	}
+	//fmt.Println("trak type ", mp4.curTrakType)
 }
 
-func parseMinf(buffer []byte, boxLen uint32) {
+func parseMinf(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tminf len ", boxLen)
-	parseAtomBox(buffer, boxLen, 3)
+	if mp4.curTrakType == TRAK_AUDIO || mp4.curTrakType == TRAK_VIDEO {
+		mp4.parseAtomBox(buffer, boxLen, 3)
+	}
 }
 
-func parseVmhd(buffer []byte, boxLen uint32) {
+func parseVmhd(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tvmhd len ", boxLen)
 }
 
-func parseTref(buffer []byte, boxLen uint32) {
+func parseTref(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\ttref len ", boxLen)
 }
 
-func parseHmhd(buffer []byte, boxLen uint32) {
+func parseHmhd(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\thmhd len ", boxLen)
 }
 
-func parseDinf(buffer []byte, boxLen uint32) {
+func parseDinf(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tdinf len ", boxLen)
-	parseAtomBox(buffer, boxLen, 4)
+	mp4.parseAtomBox(buffer, boxLen, 4)
 }
 
-func parseDref(buffer []byte, boxLen uint32) {
+func parseDref(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tdref len ", boxLen)
 }
 
-func parseStbl(buffer []byte, boxLen uint32) {
+func parseStbl(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tstbl len ", boxLen)
-	parseAtomBox(buffer, boxLen, 4)
+	mp4.parseAtomBox(buffer, boxLen, 4)
 }
 
-func parseStsd(buffer []byte, boxLen uint32) {
+func parseStsd(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tstsd len ", boxLen)
 	slen := byte42Uint32(buffer[4:8])
 	if slen != 1 {
@@ -176,46 +453,52 @@ func parseStsd(buffer []byte, boxLen uint32) {
 		return
 	}
 
-	parseAtomBox(buffer[8:], boxLen-8, 5)
+	mp4.parseAtomBox(buffer[8:], boxLen-8, 5)
 }
 
-func parseAvcc(buffer []byte, boxLen uint32) {
+func parseAvcc(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\t\t\t\t\t\t\tavcc len ", boxLen)
 }
 
-func parseStts(buffer []byte, boxLen uint32) {
+func parseStts(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tstts len ", boxLen, 4)
+	mp4.sttsBuffer = buffer[0:boxLen]
 }
 
-func parseStss(buffer []byte, boxLen uint32) {
+func parseStss(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tstss len ", boxLen)
+	mp4.stssBuffer = buffer[0:boxLen]
 }
 
-func parseStsc(buffer []byte, boxLen uint32) {
+func parseStsc(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tstsc len ", boxLen)
+	mp4.stscBuffer = buffer[0:boxLen]
 }
 
-func parseStsz(buffer []byte, boxLen uint32) {
+func parseStsz(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tstsz len ", boxLen)
+	mp4.stszBuffer = buffer[0:boxLen]
 }
 
-func parseStco(buffer []byte, boxLen uint32) {
+func parseStco(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tstco len ", boxLen)
+	mp4.stcoBuffer = buffer[0:boxLen]
 }
 
-func parseCo64(buffer []byte, boxLen uint32) {
+func parseCo64(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tco64 len ", boxLen)
+	mp4.co64Buffer = buffer[0:boxLen]
 }
 
-func parseSmhd(buffer []byte, boxLen uint32) {
+func parseSmhd(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tsmhd len ", boxLen)
 }
 
-func parseEsds(buffer []byte, boxLen uint32) {
+func parseEsds(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\t\t\t\t\t\t\tesds len ", boxLen)
 }
 
-func parseAvc1(buffer []byte, boxLen uint32) {
+func parseAvc1(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tavc1 len ", boxLen)
 	avccLen := byte42Uint32(buffer[78:82])
 	atomName := string(buffer[82:86])
@@ -224,10 +507,10 @@ func parseAvc1(buffer []byte, boxLen uint32) {
 		return
 	}
 
-	parseAvcc(buffer[86:], avccLen)
+	parseAvcc(mp4, buffer[86:], avccLen)
 }
 
-func parseMp4a(buffer []byte, boxLen uint32) {
+func parseMp4a(mp4 *Mp4Info, buffer []byte, boxLen uint32) {
 	fmt.Println("\tmp4a len ", boxLen)
 	esdsLen := byte42Uint32(buffer[28:32])
 	atomName := string(buffer[32:36])
@@ -236,13 +519,13 @@ func parseMp4a(buffer []byte, boxLen uint32) {
 		return
 	}
 
-	parseEsds(buffer[36:], esdsLen)
+	parseEsds(mp4, buffer[36:], esdsLen)
 }
 
-func parseFree(boxLen uint32, f *os.File) {
+func (mp4 *Mp4Info) parseFree(boxLen uint32, f *os.File) {
 	fmt.Println("free len ", boxLen)
 	f.Seek(int64(boxLen-8), os.SEEK_CUR)
-	ReadBox(f)
+	mp4.ReadBox(f)
 }
 
 func byte42Uint32(b []byte) uint32 {
@@ -269,7 +552,7 @@ func byte82Uint64(b []byte) uint64 {
 	return ulen
 }
 
-func ReadBox(f *os.File) {
+func (mp4 *Mp4Info) ReadBox(f *os.File) {
 	var header [8]byte
 	rlen, err := f.Read(header[:])
 	if err != nil || rlen != 8 {
@@ -284,26 +567,30 @@ func ReadBox(f *os.File) {
 
 	switch box {
 	case "mdat":
-		parseMdat(blen, f)
+		mp4.parseMdat(blen, f)
 	case "ftyp":
-		parseFtyp(blen, f)
+		mp4.parseFtyp(blen, f)
 	case "moov":
-		parseMoov(blen, f)
+		mp4.parseMoov(blen, f)
 	case "free":
-		parseFree(blen, f)
+		mp4.parseFree(blen, f)
 	default:
 		fmt.Println("unknown box ", box)
 	}
 }
 
-func ParseMp4(filename string) {
+func ParseMp4(filename string) *Mp4Info {
 	fmt.Println(filename)
+	file, _ := os.OpenFile("e:\\noob.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	logger = log.New(file, "", 0)
 
 	f, err := os.Open(filename)
 	if err != nil {
-		fmt.Println("open file err ", err)
-		return
+		fmt.Println("open file err ", err, f)
+		return nil
 	}
 
-	ReadBox(f)
+	mp4 := new(Mp4Info)
+	mp4.ReadBox(f)
+	return mp4
 }
