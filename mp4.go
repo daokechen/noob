@@ -8,11 +8,12 @@ import (
 )
 
 const (
-	FRAME_AUDIO     = 0
-	FRAME_VIDEO_I   = 1 //65
-	FRAME_VIDEO_SPS = 2 //67
-	FRAME_VIDEO_PPS = 3 //68
-	FRAME_VIDEO_SEI = 4 // 06
+	FRAME_AUDIO     = 1
+	FRAME_VIDEO     = 2
+	FRAME_VIDEO_I   = 3 //65
+	FRAME_VIDEO_SPS = 4 //67
+	FRAME_VIDEO_PPS = 5 //68
+	FRAME_VIDEO_SEI = 6 // 06
 )
 
 type SampleInfo struct {
@@ -20,6 +21,7 @@ type SampleInfo struct {
 	Offset    uint32
 	FrameType uint32
 	Delta     uint32
+	Next      *SampleInfo
 }
 
 const (
@@ -34,17 +36,20 @@ type ChunkInfo struct {
 }
 
 type Mp4Info struct {
-	AudioInfo   []SampleInfo
-	VideoInfo   []SampleInfo
-	curTrakType string
-	audioChunk  []ChunkInfo
-	videoChunk  []ChunkInfo
-	sttsBuffer  []byte
-	stszBuffer  []byte
-	stssBuffer  []byte
-	stcoBuffer  []byte
-	stscBuffer  []byte
-	co64Buffer  []byte
+	AudioInfo        []SampleInfo
+	VideoInfo        []SampleInfo
+	audioSampleCount uint32
+	videoSampleCount uint32
+	SampleHeader     SampleInfo
+	curTrakType      string
+	audioChunk       []ChunkInfo
+	videoChunk       []ChunkInfo
+	sttsBuffer       []byte
+	stszBuffer       []byte
+	stssBuffer       []byte
+	stcoBuffer       []byte
+	stscBuffer       []byte
+	co64Buffer       []byte
 }
 
 var logger *log.Logger
@@ -213,30 +218,33 @@ func (mp4 *Mp4Info) co64Parse() {
 		// 第一个chunk肯定是 1,所以第一次直接和ci[1]比较
 		if curStscIndex == len(ci)-1 || (i+1) < ci[curStscIndex+1].firstIndex {
 			si[sampleIndex].Offset = co
-			logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 1",
-				sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
-				si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+
+			//logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 1",
+			//sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+			//si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
 			sampleIndex++
 			for j := 1; j < ci[curStscIndex].sampleCount; j++ {
 				si[sampleIndex].Offset = si[sampleIndex-1].Offset + si[sampleIndex-1].FrameLen
-				logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 2",
-					sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
-					si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+
+				//logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 2",
+				//sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+				//si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
 				sampleIndex++
 			}
 		} else {
 			curStscIndex++
-
 			si[sampleIndex].Offset = co
-			logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 3",
-				sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
-				si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+
+			//logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 3",
+			//sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+			//si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
 			sampleIndex++
 			for j := 1; j < ci[curStscIndex].sampleCount; j++ {
 				si[sampleIndex].Offset = si[sampleIndex-1].Offset + si[sampleIndex-1].FrameLen
-				logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 4",
-					sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
-					si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
+
+				//logger.Printf("sample index %d offset %08x offset %d iframe %d len %d - 4",
+				//sampleIndex, si[sampleIndex].Offset, si[sampleIndex].Offset,
+				//si[sampleIndex].FrameType, si[sampleIndex].FrameLen)
 				sampleIndex++
 			}
 		}
@@ -276,22 +284,30 @@ func (mp4 *Mp4Info) stszParse() {
 	sampleCount := mp4.stszBuffer[8:12]
 	count := byte42Uint32(sampleCount)
 	var si []SampleInfo
+	var frameType uint32 = 0
 
 	if mp4.curTrakType == TRAK_AUDIO {
-		mp4.AudioInfo = make([]SampleInfo, count)
+		mp4.AudioInfo = make([]SampleInfo, count+1)
 		si = mp4.AudioInfo[:]
+		frameType = FRAME_AUDIO
+		mp4.audioSampleCount = count
 	} else if mp4.curTrakType == TRAK_VIDEO {
-		mp4.VideoInfo = make([]SampleInfo, count)
+		mp4.VideoInfo = make([]SampleInfo, count+1)
 		si = mp4.VideoInfo[:]
+		frameType = FRAME_VIDEO
+		mp4.videoSampleCount = count
 	}
 
 	for i := 0; i < int(count); i++ {
 		sampleSize := mp4.stszBuffer[12+4*i : 16+4*i]
 		ss := byte42Uint32(sampleSize)
 		si[i].FrameLen = ss
+		si[i].FrameType = frameType
+		si[i].Next = &si[i+1]
 		//logger.Println("index ", i, " size ", ss)
 	}
 
+	si[count-1].Next = nil
 	if mp4.curTrakType == TRAK_VIDEO {
 		mp4.stssParse()
 	}
@@ -592,5 +608,40 @@ func ParseMp4(filename string) *Mp4Info {
 
 	mp4 := new(Mp4Info)
 	mp4.ReadBox(f)
+	f.Close()
+
+	as := mp4.AudioInfo
+	vs := mp4.VideoInfo
+	avs := &mp4.SampleHeader
+	i, j := 0, 0
+
+	for {
+		if as[i].Offset < vs[j].Offset {
+			//logger.Println("offset ", as[i].Offset, " audio")
+			avs.Next = &as[i]
+			avs = &as[i]
+			if i < int(mp4.audioSampleCount-1) {
+				i++
+			} else {
+				avs.Next = &vs[j]
+				break
+			}
+		} else {
+			//logger.Println("offset ", vs[i].Offset, " video")
+			avs.Next = &vs[j]
+			avs = &vs[j]
+			if j < int(mp4.videoSampleCount-1) {
+				j++
+			} else {
+				avs.Next = &as[i]
+				break
+			}
+		}
+	}
+
+	//for avss := &mp4.SampleHeader; avss != nil; avss = avss.Next {
+	//	logger.Println("offset ", avss.Offset, " frame len ", avss.FrameLen, " type ", avss.FrameType)
+	//}
+
 	return mp4
 }

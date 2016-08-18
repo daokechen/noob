@@ -15,6 +15,11 @@ import (
 	"time"
 )
 
+type FrameInfo struct {
+	buf   []byte
+	delta int
+}
+
 func main() {
 	port := "554"
 	fmt.Printf("cpu %d\n", runtime.NumCPU())
@@ -26,8 +31,6 @@ func main() {
 	}
 
 	InitDecoders()
-	mp4 := ParseMp4(os.Args[1])
-	fmt.Println("mp4 len ", mp4.VideoInfo[0].FrameLen)
 
 	tcpAddr, err := net.ResolveTCPAddr("tcp4", ":"+port)
 	if err != nil {
@@ -144,6 +147,35 @@ func (rr *rtspRequest) handleSetup() {
 	fmt.Fprintf(rr.c, "%s", setupResponse)
 }
 
+func readLoop(ac chan *FrameInfo, vc chan *FrameInfo) {
+	mp4 := ParseMp4(os.Args[1])
+
+	f, err := os.Open(os.Args[1])
+	if err != nil {
+		fmt.Println("open file err ", err, f)
+		return
+	}
+
+	si := mp4.SampleHeader.Next
+	f.Seek(int64(si.Offset), os.SEEK_SET)
+
+	for ; si != nil; si = si.Next {
+		fi := new(FrameInfo)
+		fi.buf = make([]byte, si.FrameLen)
+		fi.delta = int(si.Delta)
+		f.Read(fi.buf)
+
+		//fmt.Println("frame type ", si.FrameType, " len ", si.FrameLen)
+		if si.FrameType == FRAME_AUDIO {
+			ac <- fi
+		} else {
+			vc <- fi
+		}
+	}
+
+	f.Close()
+}
+
 func (rr *rtspRequest) handlePlay() {
 	resp := "RTSP/1.0 200 OK\r\n"
 	resp += "Server: noob Server(2.0)\r\n"
@@ -153,8 +185,12 @@ func (rr *rtspRequest) handlePlay() {
 	resp += "Range: npt=0.000-\r\n\r\n"
 	fmt.Fprintf(rr.c, "%s", resp)
 
-	go videoRtpLoop(rr.c)
-	go audioRtpLoop(rr.c)
+	ac := make(chan *FrameInfo, 50)
+	vc := make(chan *FrameInfo, 50)
+
+	go readLoop(ac, vc)
+	go Mp4VideoRtpLoop(rr.c, vc)
+	go Mp4AudioRtpLoop(rr.c, ac)
 }
 
 const RTP_MAX_LEN = 1440
@@ -185,6 +221,22 @@ func buildAudioRtp(buffer []byte, seq uint16, ts uint32, alen int) []byte {
 	rtp[15] = byte((alen & 0x1F) << 3)
 
 	return rtp
+}
+
+func Mp4AudioRtpLoop(c *net.TCPConn, ac chan *FrameInfo) {
+	var ts uint32 = 10000
+	var seq uint16 = 1
+
+	for fi := range ac {
+		seq++
+		ts += uint32(fi.delta)
+		alen := len(fi.buf)
+
+		rtp := buildAudioRtp(fi.buf, seq, ts, alen)
+		sendAudioRtp(c, rtp[:alen+16])
+
+		time.Sleep(time.Millisecond * time.Duration(fi.delta*1000/48000))
+	}
 }
 
 func audioRtpLoop(c *net.TCPConn) {
@@ -302,6 +354,87 @@ func sendRtp(c *net.TCPConn, rtp []byte) {
 
 	copy(buf[4:], rtp)
 	c.Write(buf)
+}
+
+func Mp4VideoRtpLoop(c *net.TCPConn, vc chan *FrameInfo) {
+	var ts uint32 = 10000
+	var seq uint16 = 1
+
+	for fi := range vc {
+		totalLen := 0
+		buf := fi.buf
+		for {
+			vlen := int(buf[totalLen]) << 24
+			vlen += int(buf[totalLen+1]) << 16
+			vlen += int(buf[totalLen+2]) << 8
+			vlen += int(buf[totalLen+3])
+
+			buffer := buf[totalLen+4:]
+			totalLen += vlen
+			totalLen += 4
+			if buffer[0] == 0x67 || buffer[0] == 0x61 {
+				ts += uint32(fi.delta)
+			}
+
+			var marker byte = 0
+			if vlen < RTP_MAX_LEN-13 {
+				if buffer[0] == 0x61 {
+					marker = 0x80
+				}
+				seq++
+				rtp := buildRtp(buffer, seq, ts, marker)
+				sendRtp(c, rtp[:vlen+12])
+			} else {
+				// first rtp packet
+				seq++
+				slen := RTP_MAX_LEN - 13
+				buf := buffer[:slen]
+				vlen -= slen
+				count := slen
+				flag := (buffer[0] & 0x0F) | 0x80
+				rtp := buildFuaRtp(buf, seq, ts, marker, flag, 13)
+				sendRtp(c, rtp[:RTP_MAX_LEN])
+
+				// other rtp packet
+
+				for {
+					if vlen < slen {
+						break
+					}
+
+					slen = RTP_MAX_LEN - 14
+					seq++
+					buf = buffer[count : count+slen]
+
+					vlen -= slen
+					count += slen
+					flag = buffer[0] & 0x0F
+					rtp = buildFuaRtp(buf, seq, ts, marker, flag, 14)
+					sendRtp(c, rtp[:RTP_MAX_LEN])
+				}
+
+				// last rtp packet
+				seq++
+				rbuf := buffer[count:]
+				flag = (buffer[0] & 0x0F) | 0x40
+				marker = 0x80
+				rtp = buildFuaRtp(rbuf, seq, ts, marker, flag, 14)
+				if vlen != len(rbuf) {
+					fmt.Println("vlen != rlen ", vlen, len(rbuf))
+				}
+				rlen := len(rbuf) + 13
+				sendRtp(c, rtp[:rlen])
+			}
+
+			if buffer[0] != 0x68 && buffer[0] != 0x06 && buffer[0] != 0x67 {
+				time.Sleep(time.Millisecond * time.Duration(fi.delta*1000/90000))
+			}
+
+			if totalLen == len(buf) {
+				break
+			}
+		}
+	}
 }
 
 func videoRtpLoop(c *net.TCPConn) {
