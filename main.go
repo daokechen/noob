@@ -30,6 +30,7 @@ func main() {
 		return
 	}
 
+	go RtmpInit()
 	InitDecoders()
 
 	tcpAddr, err := net.ResolveTCPAddr("tcp4", ":"+port)
